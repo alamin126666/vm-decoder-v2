@@ -278,21 +278,75 @@ def inject_capture_script(html: str) -> str:
 
 # ── JS RECONSTRUCT ──────────────────────────────────────────
 def reconstruct_from_capture(capture_data: dict, original_html: str) -> str:
-    """Reconstruct clean JS from runtime capture"""
+    """Reconstruct clean JS from runtime capture.
+    Handles BOTH formats:
+      - Manual JSON flow: network = {'fetch': [...], 'xhr': [...]}, storage = {'localStorage': [...]},
+        execution = {'evalCalls': [...], 'functionCalls': [...]}
+      - CDP flow:         network/storage are LISTS of typed events, execution absent
+    """
     import json as json_lib
 
-    strings = capture_data.get('unique_strings', [])
+    strings = [str(s) for s in capture_data.get('unique_strings', []) if s is not None]
     network = capture_data.get('network', {})
     storage = capture_data.get('storage', {})
     execution = capture_data.get('execution', {})
 
+    # ── Normalize network (list in CDP mode, dict in manual mode) ──
+    if isinstance(network, list):
+        fetch_calls, xhr_calls = [], []
+        for x in network:
+            if not isinstance(x, dict):
+                continue
+            t = x.get('type', '')
+            if t in ('fetch', 'fetchResponse'):
+                item = dict(x)
+                # CDP stores fetched bodies under 'body' — expose as 'response' too
+                if 'response' not in item and item.get('body'):
+                    item['response'] = item['body']
+                fetch_calls.append(item)
+            elif t in ('xhr', 'xhrResponse'):
+                item = dict(x)
+                if 'response' not in item and item.get('body'):
+                    item['response'] = item['body']
+                xhr_calls.append(item)
+    else:
+        fetch_calls = network.get('fetch', []) if isinstance(network, dict) else []
+        xhr_calls = network.get('xhr', []) if isinstance(network, dict) else []
+
+    # ── Normalize storage (list in CDP mode, dict in manual mode) ──
+    if isinstance(storage, list):
+        ls_data = [x for x in storage if isinstance(x, dict)]
+    else:
+        ls_data = storage.get('localStorage', []) if isinstance(storage, dict) else []
+
+    # CDP entries use {type:'lsGet'/'lsSet', key, val} — map to {op, k, v}
+    norm_ls = []
+    for x in ls_data:
+        y = dict(x)
+        t = y.get('type', '')
+        if 'op' not in y:
+            y['op'] = 'set' if t == 'lsSet' else 'get' if t == 'lsGet' else ''
+        if 'k' not in y and 'key' in y:
+            y['k'] = y['key']
+        if 'v' not in y and 'val' in y:
+            y['v'] = y['val']
+        norm_ls.append(y)
+    ls_data = norm_ls
+
+    # ── Normalize execution (absent in CDP mode → use top-level eval_calls) ──
+    if not isinstance(execution, dict) or not execution:
+        execution = {
+            'evalCalls': capture_data.get('eval_calls', []),
+            'functionCalls': capture_data.get('function_calls', [])
+        }
+
     # Extract key data
     apis = [s for s in strings if s.startswith('http')]
     keys = [s for s in strings if len(s) < 20 and s.isdigit() and len(s) >= 4]
-    function_names = list({f['fn'] for f in execution.get('functionCalls', []) if not f['fn'].startswith('$')})
-    fetch_calls = network.get('fetch', [])
-    xhr_calls = network.get('xhr', [])
-    ls_data = storage.get('localStorage', [])
+    function_names = list({
+        f.get('fn', '') for f in execution.get('functionCalls', [])
+        if isinstance(f, dict) and f.get('fn') and not f['fn'].startswith('$')
+    })
     eval_calls = execution.get('evalCalls', [])
 
     return {
@@ -302,7 +356,8 @@ def reconstruct_from_capture(capture_data: dict, original_html: str) -> str:
         'fetch_calls': fetch_calls,
         'xhr_calls': xhr_calls,
         'localStorage': ls_data,
-        'eval_code': eval_calls,
+        'eval_calls': eval_calls,
+        'eval_code': eval_calls,   # keep old key for backward compat
         'all_strings': strings
     }
 
